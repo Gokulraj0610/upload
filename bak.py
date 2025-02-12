@@ -40,6 +40,17 @@ BATCH_SIZE = 5  # Size of each batch
 NUM_PARALLEL_BATCHES = 4  # Number of batches to process in parallel
 CACHE_TTL = 3600
 
+# Error handler for all exceptions
+@app.errorhandler(Exception)
+def handle_exception(e):
+    # Log the error
+    app.logger.error(f"Unhandled exception: {str(e)}")
+    # Return JSON instead of HTML
+    return jsonify({
+        "type": "error",
+        "message": str(e)
+    }), 500
+
 # Initialize cache
 class ImageCache:
     def __init__(self):
@@ -165,7 +176,12 @@ def process_single_comparison(source_bytes, drive_file, processor):
 def stream_results(generator):
     """Helper function to stream JSON responses"""
     for item in generator:
-        yield json.dumps(item) + '\n'
+        if isinstance(item, str):
+            # If the item is already a string (JSON), yield it
+            yield item + '\n'
+        else:
+            # If it's a dict/object, convert to JSON
+            yield json.dumps(item) + '\n'
 
 def process_batch(batch, optimized_source, processor, progress_queue):
     """Process a batch of images and return results"""
@@ -205,25 +221,27 @@ def process_image_stream(image_bytes):
         )
 
         if not source_response['FaceDetails']:
-            yield {'type': 'error', 'message': 'No face detected in the uploaded image'}
+            yield {"type": "error", "message": "No face detected in the uploaded image"}
             return
 
         drive_images = list_drive_images()
+        if not drive_images:
+            yield {"type": "error", "message": "No images found in the specified folder"}
+            return
+
         total_images = len(drive_images)
         processed = 0
         
-        # Split images into batches for parallel processing
+        # Split images into batches
         all_batches = [
             drive_images[i:i + BATCH_SIZE]
             for i in range(0, len(drive_images), BATCH_SIZE)
         ]
         
-        # Process batches in groups of NUM_PARALLEL_BATCHES
         for i in range(0, len(all_batches), NUM_PARALLEL_BATCHES):
             current_batches = all_batches[i:i + NUM_PARALLEL_BATCHES]
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_PARALLEL_BATCHES) as executor:
-                # Submit all batches for parallel processing
                 future_to_batch = {
                     executor.submit(
                         process_batch,
@@ -234,22 +252,19 @@ def process_image_stream(image_bytes):
                     ): batch for batch in current_batches
                 }
                 
-                # Track progress and yield results
                 pending_futures = set(future_to_batch.keys())
                 
                 while pending_futures:
-                    # Check progress queue
                     while not progress_queue.empty():
                         progress_queue.get()
                         processed += 1
                         if processed % 5 == 0:
                             yield {
-                                'type': 'progress',
-                                'processed': processed,
-                                'total': total_images
+                                "type": "progress",
+                                "processed": processed,
+                                "total": total_images
                             }
                     
-                    # Check for completed futures
                     done_futures, pending_futures = concurrent.futures.wait(
                         pending_futures,
                         timeout=0.1,
@@ -261,58 +276,87 @@ def process_image_stream(image_bytes):
                             batch_results = future.result()
                             for result in batch_results:
                                 yield {
-                                    'type': 'match',
-                                    'data': result
+                                    "type": "match",
+                                    "data": result
                                 }
                         except Exception as e:
                             logger.error(f"Error processing batch: {e}")
-                            continue
+                            yield {
+                                "type": "error",
+                                "message": f"Error processing batch: {str(e)}"
+                            }
 
     except Exception as e:
         logger.error(f"Error in face comparison: {e}")
-        yield {'type': 'error', 'message': str(e)}
+        yield {
+            "type": "error",
+            "message": str(e)
+        }
 
 # Routes
 @app.route('/')
 def home():
-    return send_file('index.html')
+    return jsonify({"type": "success", "message": "API is running"})
 
 @app.route('/static/<path:path>')
 def send_static(path):
-    return send_from_directory('static', path)
-
-@app.route('/app.js')
-def serve_js():
-    return send_from_directory('.', 'app.js')
-
-@app.route('/styles.css')
-def serve_css():
-    return send_from_directory('.', 'styles.css')
+    try:
+        return send_from_directory('static', path)
+    except Exception as e:
+        return jsonify({
+            "type": "error",
+            "message": f"File not found: {str(e)}"
+        }), 404
 
 @app.route('/set-folder-id', methods=['POST'])
 def set_folder_id():
     global DRIVE_FOLDER_ID
-    data = request.json
-    DRIVE_FOLDER_ID = data.get('folderId')
     try:
+        data = request.json
+        if not data or 'folderId' not in data:
+            return jsonify({
+                "type": "error",
+                "message": "No folder ID provided"
+            }), 400
+
+        DRIVE_FOLDER_ID = data.get('folderId')
         folder_metadata = get_drive_service().files().get(fileId=DRIVE_FOLDER_ID, fields="name").execute()
-        return jsonify({'success': True, 'folderName': folder_metadata.get('name')})
+        
+        return jsonify({
+            "type": "success",
+            "data": {
+                "success": True,
+                "folderName": folder_metadata.get('name')
+            }
+        })
     except Exception as e:
-        return jsonify({'error': str(e)}), 400
+        return jsonify({
+            "type": "error",
+            "message": str(e)
+        }), 400
 
 @app.route('/search-face', methods=['POST'])
 def search_face():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
-
-    file = request.files['file']
-    if file.filename == '' or not allowed_file(file.filename):
-        return jsonify({'error': 'Invalid file type'}), 400
-
     try:
+        if 'file' not in request.files:
+            return jsonify({
+                "type": "error",
+                "message": "No file provided"
+            }), 400
+
+        file = request.files['file']
+        if file.filename == '' or not allowed_file(file.filename):
+            return jsonify({
+                "type": "error",
+                "message": "Invalid file type"
+            }), 400
+
         image_bytes = file.read()
         if len(image_bytes) > MAX_IMAGE_SIZE:
-            return jsonify({'error': 'Image size must be less than 15MB'}), 400
+            return jsonify({
+                "type": "error",
+                "message": "Image size must be less than 15MB"
+            }), 400
 
         return Response(
             stream_results(process_image_stream(image_bytes)),
@@ -321,7 +365,10 @@ def search_face():
 
     except Exception as e:
         logger.error(f"Error in search_face: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            "type": "error",
+            "message": str(e)
+        }), 500
 
 @app.route('/image/<file_id>')
 def serve_image(file_id):
@@ -364,7 +411,10 @@ def serve_image(file_id):
             
     except Exception as e:
         logger.error(f"Error serving image {file_id}: {e}")
-        return jsonify({'error': str(e)}), 404
+        return jsonify({
+            "type": "error",
+            "message": str(e)
+        }), 404
     finally:
         if 'fh' in locals():
             try:
@@ -387,11 +437,17 @@ try:
         region_name=aws_creds['region']
     )
     
-    DRIVE_FOLDER_ID = None
+    DRIVE_FOLDER_ID = None  # Will be set via API call
     
 except Exception as e:
     logger.error(f"Error during initialization: {e}")
     raise
 
+# Server startup
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False,ssl_context=('certs/cert.pem', 'certs/key.pem'))
+    app.run(
+        host='0.0.0.0',
+        port=5000,
+        debug=False,
+        ssl_context=('certs/cert.pem', 'certs/key.pem')
+    )
