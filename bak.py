@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file, send_from_directory, Response
 from flask_cors import CORS
+from flask_talisman import Talisman
 from werkzeug.utils import secure_filename
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -9,6 +10,7 @@ import os
 import io
 import logging
 import json
+import ssl
 from PIL import Image
 import concurrent.futures
 import threading
@@ -21,7 +23,28 @@ from typing import List, Dict, Any
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)
+
+# Configure CORS with HTTPS
+CORS(app, resources={
+    r"/*": {
+        "origins": ["https://picfinder-develop.web.app"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
+
+# Configure Talisman for HTTPS security headers
+talisman = Talisman(
+    app,
+    force_https=True,
+    strict_transport_security=True,
+    session_cookie_secure=True,
+    content_security_policy={
+        'default-src': "'self'",
+        'img-src': "*",
+        'connect-src': ["'self'", "https://picfinder-develop.web.app"]
+    }
+)
 
 STATIC_FOLDER = 'static'
 if not os.path.exists(STATIC_FOLDER):
@@ -412,7 +435,7 @@ def serve_image(file_id):
     except Exception as e:
         logger.error(f"Error serving image {file_id}: {e}")
         return jsonify({
-            "type": "error",
+        "type": "error",
             "message": str(e)
         }), 404
     finally:
@@ -443,11 +466,39 @@ except Exception as e:
     logger.error(f"Error during initialization: {e}")
     raise
 
+# Create rate limiter
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
+
+# Apply rate limiting to specific endpoints
+@limiter.limit("1 per second")
+@app.route('/search-face', methods=['POST'])
+def rate_limited_search_face():
+    return search_face()
+
 # Server startup
 if __name__ == '__main__':
+    # Create SSL context with strong settings
+    ssl_context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain(
+        certfile='certs/cert.pem',
+        keyfile='certs/key.pem'
+    )
+    
+    # Configure SSL context with secure settings
+    ssl_context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1  # Disable TLS 1.0 and 1.1
+    ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+    ssl_context.set_ciphers('ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256')
+    
     app.run(
         host='0.0.0.0',
         port=5000,
         debug=False,
-        ssl_context=('certs/cert.pem', 'certs/key.pem')
+        ssl_context=ssl_context
     )
